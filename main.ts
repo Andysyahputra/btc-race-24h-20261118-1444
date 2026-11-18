@@ -32,6 +32,18 @@ const MAX_SLIPPAGE_BPS = 100;
 const closes: bigint[] = [];
 let entryFill: bigint | null = null;
 
+/** Entry fill implied by a position's cost and quantity (quote units per
+ *  unit, in the symbol's price scale). Used only when the bot is holding
+ *  but no buy fill was recorded, so the exit still has a reference. */
+function impliedFill(state: BarsState, qty: bigint, cost: bigint): bigint | null {
+  const sym = state.symbols.get(SYMBOL);
+  if (sym === undefined || qty <= 0n) return null;
+  const num = cost * 10n ** BigInt(sym.qty_scale + sym.price_scale);
+  const den = qty * 10n ** BigInt(state.hello.capital.quote_scale);
+  if (den <= 0n) return null;
+  return num / den;
+}
+
 await runBars({
   onBatch(state: BarsState, batch: Batch) {
     // Fold this batch's fills in first: a buy fill sets the entry fill,
@@ -57,13 +69,15 @@ await runBars({
 
     if (holding) {
       // Exit only on the entry fill, which is known once the buy filled.
-      if (entryFill === null) return [];
+      // If the fill record was missed, fall back to the position's cost.
+      const fill = entryFill ?? impliedFill(state, pos.qty, pos.cost);
+      if (fill === null) return [];
       // Take profit: close >= fill * (1 + TP).
-      if (close * 10000n >= entryFill * BigInt(10000 + TP_BPS)) {
+      if (close * 10000n >= fill * BigInt(10000 + TP_BPS)) {
         return [{ side: 'sell', symbol: SYMBOL, qty: pos.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       // Safety stop: close <= fill * (1 - SL).
-      if (close * 10000n <= entryFill * BigInt(10000 - SL_BPS)) {
+      if (close * 10000n <= fill * BigInt(10000 - SL_BPS)) {
         return [{ side: 'sell', symbol: SYMBOL, qty: pos.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];

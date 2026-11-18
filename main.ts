@@ -1,126 +1,91 @@
-// Dip-and-hold: a single-trade mean-reversion bot for a grind-down window.
+// Deep-dip hold — BTC Race 24h (btc-race-24h-20261118-1444).
 //
-// Design (from the dev-window diagnosis): the window grinds down with one
-// slow recovery. Fast mean-reversion signals (SMA dip, RSI) fire dozens of
-// times on 1-minute noise and lose to the 26 bps round-trip cost; momentum
-// is negatively predictive here (sharp up-moves reverse). The one robust
-// edge is a single patient trade: buy the first bounce after a deep dip
-// below the 60-bar high, then HOLD through the chop with no tight stop
-// (a tight stop is what killed every earlier design) and exit at a fixed
-// take-profit near the recovery peak. A wide 2.5% safety stop only guards
-// against a catastrophic decline; it never triggers on the dev window
-// (max drawdown of the trade is ~1.5%).
+// One patient trade: buy the first deep dip and ride the recovery to a
+// fixed target, instead of scalping small bounces. The dev window is a
+// steady grind down with a single +2.5% recovery in the middle; small
+// dips after the recovery are 1-minute noise that lose to the 26 bps
+// round-trip cost, so this bot only buys a dip deep enough to be the
+// real bottom, then holds through the chop.
 //
-// Entry (flat only): the latest close is at least 1.5% below the highest
-// close of the previous 60 bars, AND the latest close is above the previous
-// bar's close (bounce confirmation). One buy for the full cash balance.
-// No new entries after scored bar 1200 (too little window left for the
-// trade to reach its target).
-//
-// Exit (holding): take profit at +1.9% above the entry FILL price, or the
-// 2.5% safety stop below it. Prices are measured from the harness-reported
-// fill price, never from the trigger close.
-//
-// Deterministic: no randomness, no clock, no environment reads. All
-// decisions come only from the bars received.
+// Rules (all in integer basis points, no floats, no clock, no randomness):
+//   Entry: close <= 60-bar high * (1 - 2.4%) AND close > previous close
+//          (a bounce after a deep dip). Full cash, one position.
+//   Exit:  take profit at entry fill * (1 + 2.6%), or safety stop at
+//          entry fill * (1 - 2.5%) against a catastrophic decline.
+//   No new entries after scored bar 1200 (the tail of the window only
+//   grinds down, with no recovery left to ride).
+// Holding is decided from the harness-reported position, and the entry
+// fill is cleared only when a sell actually fills, so a rejected sell
+// retries the exit instead of the bot thinking it is flat and re-buying.
 
-import { runBars } from "./vendor/makefun-bars.ts";
-import type { BarsState, Batch } from "./vendor/makefun-bars.ts";
+import { runBars } from './vendor/makefun-bars.ts';
+import type { BarsState, Batch } from './vendor/makefun-bars.ts';
 
-const SYMBOL = "CBBTC";
-const PRICE_SCALE = 1e5;
+const SYMBOL = 'CBBTC';
+const LOOKBACK = 60;
+const DIP_BPS = 240; // 2.4% below the 60-bar high
+const TP_BPS = 260; // 2.6% above the entry fill
+const SL_BPS = 250; // 2.5% below the entry fill
+const MAX_SCORED_BAR = 1200;
+const MAX_SLIPPAGE_BPS = 100;
 
-// Strategy parameters.
-const DIP_LOOKBACK = 60; // bars for the rolling high
-const DIP_PCT = 0.015; // entry: close >= 1.5% below the 60-bar high
-const TAKE_PROFIT = 0.019; // exit: +1.9% above the entry fill
-const SAFETY_STOP = 0.025; // exit: -2.5% below the entry fill (safety only)
-const LAST_ENTRY_BAR = 1200; // no new entries after this scored bar
-
-// Close history in dollars, including warm-up bars.
-const closes: number[] = [];
-// Scored bars seen (warm-up batches do not count).
-let scoredBar = 0;
-// Entry fill price in dollars, from the harness-reported fill. Null when flat.
-let entryFill: number | null = null;
-
-function closeDollars(bar: { c: string }): number {
-  return Number(BigInt(bar.c)) / PRICE_SCALE;
-}
-
-function rollingHigh(n: number): number | null {
-  if (closes.length < n) return null;
-  let hi = -Infinity;
-  for (let i = closes.length - n; i < closes.length; i++) {
-    if (closes[i]! > hi) hi = closes[i]!;
-  }
-  return hi;
-}
+const closes: bigint[] = [];
+let entryFill: bigint | null = null;
 
 await runBars({
   onBatch(state: BarsState, batch: Batch) {
-    const bar = batch.bars.find((b) => b.symbol === SYMBOL);
-    if (bar === undefined) return [];
-
-    // Fold in this batch's fills first: a filled buy sets the entry fill
-    // price; a filled sell clears the position.
-    for (const fill of batch.fills) {
-      if (fill.symbol !== SYMBOL) continue;
-      if (fill.status !== "filled") continue;
-      if (fill.side === "buy") {
-        entryFill = Number(BigInt(fill.price)) / PRICE_SCALE;
-      } else if (fill.side === "sell") {
-        entryFill = null;
-      }
+    // Fold this batch's fills in first: a buy fill sets the entry fill,
+    // a sell fill clears it. A rejected order changes nothing.
+    for (const f of batch.fills) {
+      if (f.symbol !== SYMBOL) continue;
+      if (f.status !== 'filled') continue;
+      if (f.side === 'buy') entryFill = BigInt(f.price);
+      if (f.side === 'sell') entryFill = null;
     }
 
-    const close = closeDollars(bar);
-    const prevClose = closes.length > 0 ? closes[closes.length - 1]! : null;
+    // Never trade on a warm-up batch; still record its close for history.
+    const bar = state.latest.get(SYMBOL);
+    if (bar !== undefined) closes.push(BigInt(bar.c));
 
-    // Warm-up batches build history but never trade.
-    if (state.warmingUp) {
-      closes.push(close);
-      return [];
-    }
-    scoredBar += 1;
+    if (state.warmingUp) return [];
 
-    // Holding is decided by the harness-reported position, NOT by entryFill:
-    // a sell that gets rejected must not make the bot think it is flat (it
-    // still holds the position and must retry the exit, never buy again).
-    // entryFill is only set/cleared by FILLS, never when an order is sent.
+    const close = state.close(SYMBOL);
+    if (close === null) return [];
+
     const pos = state.positions.get(SYMBOL);
-    const holding = pos !== undefined;
-    // Defensive fallback: if a position exists but no fill price was recorded
-    // (cannot happen in a normal run), estimate the entry from the cost basis.
-    const entry = entryFill !== null ? entryFill : holding ? Number(pos!.cost) * 100 / Number(pos!.qty) : null;
+    const holding = pos !== undefined && pos.qty > 0n;
 
-    // Exit checks (holding only).
-    if (holding && entry !== null) {
-      if (close >= entry * (1 + TAKE_PROFIT)) {
-        return [{ side: "sell", symbol: SYMBOL, qty: pos!.qty, max_slippage_bps: 100 }];
+    if (holding) {
+      // Exit only on the entry fill, which is known once the buy filled.
+      if (entryFill === null) return [];
+      // Take profit: close >= fill * (1 + TP).
+      if (close * 10000n >= entryFill * BigInt(10000 + TP_BPS)) {
+        return [{ side: 'sell', symbol: SYMBOL, qty: pos.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
-      if (close <= entry * (1 - SAFETY_STOP)) {
-        return [{ side: "sell", symbol: SYMBOL, qty: pos!.qty, max_slippage_bps: 100 }];
+      // Safety stop: close <= fill * (1 - SL).
+      if (close * 10000n <= entryFill * BigInt(10000 - SL_BPS)) {
+        return [{ side: 'sell', symbol: SYMBOL, qty: pos.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
-      closes.push(close);
       return [];
     }
 
-    // Entry checks (flat only).
-    if (!holding && scoredBar <= LAST_ENTRY_BAR) {
-      const high = rollingHigh(DIP_LOOKBACK);
-      if (
-        high !== null &&
-        prevClose !== null &&
-        close <= high * (1 - DIP_PCT) &&
-        close > prevClose
-      ) {
-        closes.push(close);
-        return [{ side: "buy", symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: 100 }];
-      }
+    // Flat: only the deep-dip entry, and only before the tail.
+    const scored = state.seq - state.warmupBars;
+    if (scored > MAX_SCORED_BAR) return [];
+    if (closes.length < LOOKBACK) return [];
+    const prev = closes[closes.length - 2];
+    if (prev === undefined) return [];
+    // 60-bar high over the last LOOKBACK closes, current bar included.
+    let high = 0n;
+    for (let i = closes.length - LOOKBACK; i < closes.length; i++) {
+      const c = closes[i]!;
+      if (c > high) high = c;
     }
-
-    closes.push(close);
+    // Deep dip with a bounce: close <= high * (1 - DIP) and close > prev.
+    if (close * 10000n <= high * BigInt(10000 - DIP_BPS) && close > prev) {
+      if (state.cash <= 0n) return [];
+      return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    }
     return [];
   },
 });

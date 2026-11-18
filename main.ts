@@ -84,19 +84,23 @@ await runBars({
     }
     scoredBar += 1;
 
-    const holding = state.positions.get(SYMBOL) !== undefined && entryFill !== null;
+    // Holding is decided by the harness-reported position, NOT by entryFill:
+    // a sell that gets rejected must not make the bot think it is flat (it
+    // still holds the position and must retry the exit, never buy again).
+    // entryFill is only set/cleared by FILLS, never when an order is sent.
+    const pos = state.positions.get(SYMBOL);
+    const holding = pos !== undefined;
+    // Defensive fallback: if a position exists but no fill price was recorded
+    // (cannot happen in a normal run), estimate the entry from the cost basis.
+    const entry = entryFill !== null ? entryFill : holding ? Number(pos!.cost) * 100 / Number(pos!.qty) : null;
 
     // Exit checks (holding only).
-    if (holding && entryFill !== null) {
-      if (close >= entryFill * (1 + TAKE_PROFIT)) {
-        const pos = state.positions.get(SYMBOL)!;
-        entryFill = null;
-        return [{ side: "sell", symbol: SYMBOL, qty: pos.qty, max_slippage_bps: 100 }];
+    if (holding && entry !== null) {
+      if (close >= entry * (1 + TAKE_PROFIT)) {
+        return [{ side: "sell", symbol: SYMBOL, qty: pos!.qty, max_slippage_bps: 100 }];
       }
-      if (close <= entryFill * (1 - SAFETY_STOP)) {
-        const pos = state.positions.get(SYMBOL)!;
-        entryFill = null;
-        return [{ side: "sell", symbol: SYMBOL, qty: pos.qty, max_slippage_bps: 100 }];
+      if (close <= entry * (1 - SAFETY_STOP)) {
+        return [{ side: "sell", symbol: SYMBOL, qty: pos!.qty, max_slippage_bps: 100 }];
       }
       closes.push(close);
       return [];
